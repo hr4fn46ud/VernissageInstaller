@@ -14,9 +14,14 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - uses: swift-actions/setup-swift@v2
-        with:
-          swift-version: '6.3.3'
+      - name: Install official Swift 6.3.3 toolchain
+        run: |
+          curl --fail --silent --show-error --location --retry 3 \
+            https://download.swift.org/swift-6.3.3-release/ubuntu2404/swift-6.3.3-RELEASE/swift-6.3.3-RELEASE-ubuntu24.04.tar.gz \
+            --output "$RUNNER_TEMP/swift.tar.gz"
+          mkdir "$RUNNER_TEMP/swift-toolchain"
+          tar -xzf "$RUNNER_TEMP/swift.tar.gz" --strip-components=1 -C "$RUNNER_TEMP/swift-toolchain"
+          echo "$RUNNER_TEMP/swift-toolchain/usr/bin" >> "$GITHUB_PATH"
       - name: Run tests
         run: swift test
       - name: Install matching Static Linux SDK

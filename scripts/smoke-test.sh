@@ -49,5 +49,6 @@ printf '%s\n' "$stop_help_output" | grep -Fq 'USAGE: vernissagectl stop'
 printf '%s\n' "$stop_help_output" | grep -Fq '<service>'
 printf '%s\n' "$update_help_output" | grep -Fq 'USAGE: vernissagectl update'
 printf '%s\n' "$update_help_output" | grep -Fq '<component>'
+printf '%s\n' "$update_help_output" | grep -Fq 'all'
 
 printf 'Smoke tests passed for %s\n' "$executable_path"

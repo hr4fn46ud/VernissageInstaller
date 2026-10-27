@@ -269,14 +269,191 @@ struct UpdateCommandTests {
     }
 
     @Test
-    func `Update command accepts only implemented components`() throws {
-        for rawComponent in UpdateComponent.allCases.map(\.rawValue) {
+    func `Update command accepts implemented components and all`() throws {
+        for rawComponent in UpdateComponent.allCases.map(\.rawValue) + ["all"] {
             let parsed = try VernissageCommand.parseAsRoot([
                 "update", rawComponent, "--config", "/srv/vernissage/vernissage.yml"
             ])
             let command = try #require(parsed as? UpdateCommand)
             #expect(command.component.rawValue == rawComponent)
         }
+    }
+
+    @Test
+    func `Update command rejects unknown targets`() {
+        #expect(throws: (any Error).self) {
+            try VernissageCommand.parseAsRoot(["update", "everything"])
+        }
+    }
+
+    @Test
+    func `All plans follow dependency order and group API and Jobs`() throws {
+        let batch = try ContainerUpdatePlanFactory(operatingSystem: .linux)
+            .batch(context: makeContext())
+
+        #expect(batch.plans.map(\.component) == [
+            .postgres, .redis, .minio, .server, .web, .push, .proxy, .caddy
+        ])
+        #expect(batch.skippedComponents.isEmpty)
+        #expect(batch.plans.flatMap { $0.containers.map(\.service) } == [
+            "PostgreSQL", "Redis", "MinIO", "API", "Jobs", "Web", "Push", "Proxy", "Caddy"
+        ])
+    }
+
+    @Test
+    func `All skips external dependencies and manual HTTPS`() throws {
+        let context = makeContext()
+        context.database = DatabaseConfiguration(
+            mode: .existing, host: "postgres.example.com", port: 5432,
+            database: "vernissage", username: "vernissage",
+            password: Secret(value: "database-secret"), tlsMode: .require,
+            localResources: nil
+        )
+        context.redis = RedisConfiguration(
+            mode: .existing,
+            url: Secret(value: "rediss://default:redis-secret@redis.example.com:6379/0"),
+            username: "default", host: "redis.example.com", port: 6379, database: 0,
+            password: Secret(value: "redis-secret"), usesTLS: true, localResources: nil
+        )
+        context.storage = StorageConfiguration(
+            provider: .awsS3, address: "https://s3.example.com", region: "eu-central-1",
+            bucket: "media", accessKeyId: "access-key",
+            secretAccessKey: Secret(value: "storage-secret"), http1OnlyMode: false,
+            localResources: nil
+        )
+        context.publicAccess = PublicAccessConfiguration(httpsMode: .manual)
+        context.caddy = nil
+
+        let batch = try ContainerUpdatePlanFactory(operatingSystem: .linux)
+            .batch(context: context)
+
+        #expect(batch.plans.map(\.component) == [.server, .web, .push, .proxy])
+        #expect(batch.skippedComponents == [.postgres, .redis, .minio, .caddy])
+    }
+
+    @Test
+    func `All rejects incomplete configuration instead of silently skipping it`() {
+        let context = makeContext()
+        context.caddy = nil
+        #expect(throws: ServicesInventoryError.missingConfiguration("Caddy")) {
+            try ContainerUpdatePlanFactory(operatingSystem: .linux).batch(context: context)
+        }
+
+        context.publicAccess = PublicAccessConfiguration(httpsMode: .manual)
+        context.web = nil
+        #expect(throws: ServicesInventoryError.missingConfiguration("Web")) {
+            try ContainerUpdatePlanFactory(operatingSystem: .linux).batch(context: context)
+        }
+    }
+
+    @Test
+    func `All validates later plans before starting any update`() {
+        let context = makeContext()
+        context.server = nil
+        #expect(throws: ContainerUpdatePlanError.missingConfiguration("server and domain")) {
+            try ContainerUpdatePlanFactory(operatingSystem: .linux).batch(context: context)
+        }
+    }
+
+    @Test
+    func `Batch preflight inspects all containers before any preparation`() {
+        let batch = ContainerUpdateBatch(
+            plans: [simplePlan(containerCount: 2), batchWebPlan()], skippedComponents: []
+        )
+        let runner = UpdateCommandRunner(results: [.failure("No such container: web")])
+        #expect(throws: ContainerUpdateExecutionError.containerInspectionFailed(
+            details: "No such container: web"
+        )) {
+            try ContainerUpdateExecutor(
+                commandRunner: runner,
+                writeFile: { _ in Issue.record("Preflight must not write build files") }
+            ).execute(batch)
+        }
+        #expect(runner.invocations.map(\.arguments) == [[
+            "container", "inspect", "--format",
+            "[{{json .Name}},{{json .Image}},{{json .State.Running}}]", "api", "jobs", "web"
+        ]])
+    }
+
+    @Test
+    func `Batch processes unchanged components in order and reports results`() throws {
+        let runner = UpdateCommandRunner(results: [
+            .success(batchInspection()),
+            .success("pulled"), .success(digest("a")),
+            .success(inspection(name: "api", digest: digest("a"), running: true)),
+            .success("pulled"), .success(digest("a")),
+            .success(inspection(name: "web", digest: digest("a"), running: false))
+        ])
+        var started: [UpdateComponent] = []
+        var reported: [ContainerUpdateExecutionResult] = []
+        let results = try ContainerUpdateExecutor(commandRunner: runner, writeFile: { _ in })
+            .execute(
+                ContainerUpdateBatch(
+                    plans: [simplePlan(containerCount: 1), batchWebPlan()], skippedComponents: []
+                ),
+                willUpdate: { started.append($0) },
+                didUpdate: { reported.append($0) }
+            )
+
+        #expect(started == [.server, .web])
+        #expect(reported == results)
+        #expect(results.map(\.currentServices) == [["API"], ["Web"]])
+        #expect(runner.invocations.count == 7)
+    }
+
+    @Test
+    func `Batch stops on failure and preserves completed component results`() throws {
+        let server = simplePlan(containerCount: 1)
+        let web = batchWebPlan()
+        let push = ContainerUpdatePlan(
+            component: .push, image: "push:latest", files: [], preparationCommands: [],
+            containers: [ContainerReplacementSpecification(
+                service: "Push", name: "push", createArguments: [], environment: [:]
+            )]
+        )
+        let runner = UpdateCommandRunner(results: [
+            .success(batchInspection() + "\n" + inspection(name: "push", digest: digest("a"), running: true)),
+            .success("pulled"), .success(digest("b")),
+            .success(inspection(name: "api", digest: digest("a"), running: true)),
+            .success("stopped"), .success("renamed"), .success("created"),
+            .success("started"), .success("removed"),
+            .failure("registry unavailable")
+        ])
+        var reported: [ContainerUpdateExecutionResult] = []
+        let error = #expect(throws: ContainerUpdateBatchError.self) {
+            try ContainerUpdateExecutor(commandRunner: runner, writeFile: { _ in })
+                .execute(
+                    ContainerUpdateBatch(plans: [server, web, push], skippedComponents: []),
+                    didUpdate: { reported.append($0) }
+                )
+        }
+
+        #expect(error?.component == .web)
+        #expect(error?.completed == [.server])
+        #expect(error?.notAttempted == [.push])
+        #expect(error?.localizedDescription.contains("registry unavailable") == true)
+        #expect(error?.localizedDescription.contains("not rolled back") == true)
+        #expect(reported.map(\.updatedServices) == [["API"]])
+        #expect(runner.invocations.count == 10)
+        #expect(runner.invocations.last?.arguments == ["image", "pull", "web:latest"])
+    }
+
+    private func batchWebPlan() -> ContainerUpdatePlan {
+        ContainerUpdatePlan(
+            component: .web, image: "web:latest", files: [],
+            preparationCommands: [UpdateDockerCommand(
+                arguments: ["image", "pull", "web:latest"], description: "pull web:latest"
+            )],
+            containers: [ContainerReplacementSpecification(
+                service: "Web", name: "web",
+                createArguments: ["--name", "web", "web:latest"], environment: [:]
+            )]
+        )
+    }
+
+    private func batchInspection() -> String {
+        inspection(name: "api", digest: digest("a"), running: true) + "\n"
+            + inspection(name: "web", digest: digest("a"), running: false)
     }
 
     private func simplePlan(containerCount: Int) -> ContainerUpdatePlan {

@@ -55,7 +55,7 @@ vernissagectl --help
 | `vernissagectl stop <service\|all>` | Stops one managed service or the complete instance. |
 | `vernissagectl restart <service\|all>` | Restarts one managed service or the complete instance. |
 | `vernissagectl logs <service> [--follow]` | Displays native Docker logs for a managed service. |
-| `vernissagectl update <component>` | Replaces a managed component with its currently published image or rebuilt source. |
+| `vernissagectl update <component\|all>` | Replaces one or all managed components with their currently published images or rebuilt source. |
 | `vernissagectl backup [destination]` | Creates a backup of installer-managed PostgreSQL. |
 | `vernissagectl restore <backup>` | Restores a compatible PostgreSQL backup. |
 | `vernissagectl version` | Prints the installed `vernissagectl` version. |
@@ -422,6 +422,7 @@ vernissagectl update caddy
 vernissagectl update redis
 vernissagectl update postgres
 vernissagectl update minio
+vernissagectl update all
 ```
 
 `server` updates API and Jobs together. Registry-backed images are pulled;
@@ -440,7 +441,43 @@ until Docker cleanup is performed separately.
 > verify appropriate backups before updating production services.
 
 External dependencies and manually managed HTTPS cannot be updated by this
-command. `update all` is intentionally not implemented.
+command.
+
+### Updating all managed components
+
+```bash
+vernissagectl --config /srv/vernissage/vernissage.yml update all
+```
+
+`all` selects only installer-managed components, in this order: PostgreSQL,
+Redis, MinIO, Server (API and Jobs together), Web, Push, Proxy, and Caddy.
+External PostgreSQL, Redis, S3 storage, and manually managed HTTPS are skipped
+and reported. Explicitly selecting an unmanaged component still returns an
+error.
+
+All update plans are validated and all selected containers are inspected before
+the first image pull, build, or container replacement. Components are then
+processed sequentially using the same update behavior as individual commands,
+including digest comparison, volume preservation, and preservation of stopped
+containers. Configured image tags are retained; `all` does not select newer
+major versions or update the `vernissagectl` executable. MinIO is rebuilt from
+the installer's pinned source version, rather than selecting the latest source.
+
+The first error stops the batch with a nonzero exit code. The error identifies
+the failed component, completed components, and components not yet attempted.
+Earlier successful updates remain installed. The existing container rollback
+applies only to replacement failures within the current component; there is no
+batch-wide rollback or reversal of database migrations.
+
+This is a convenience batch, not an atomic upgrade or a zero-downtime rollout.
+As with individual updates, a successful Docker start does not establish service
+readiness. Infrastructure replacement can briefly interrupt running application
+services. Create and verify appropriate backups before the batch, and check
+service health afterwards:
+
+```bash
+vernissagectl --config /srv/vernissage/vernissage.yml doctor
+```
 
 ## `backup`
 

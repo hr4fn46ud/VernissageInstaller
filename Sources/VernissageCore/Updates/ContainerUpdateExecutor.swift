@@ -174,6 +174,10 @@ struct ContainerUpdateExecutor {
         )
     }
 
+    func verifyContainers(in plans: [ContainerUpdatePlan]) throws {
+        _ = try inspectContainers(plans.flatMap { $0.containers.map(\.name) })
+    }
+
     private func prepareFiles(_ files: [UpdateFile]) throws {
         for file in files {
             do {

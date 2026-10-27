@@ -1,0 +1,48 @@
+name: Build update-all Linux test binary
+
+on:
+  push:
+    branches: [build/update-all-linux-x86_64]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: '6.3.3'
+      - name: Run tests
+        run: swift test
+      - name: Install matching Static Linux SDK
+        run: scripts/install-static-linux-sdk.sh
+      - name: Build and verify static executable
+        run: scripts/build-release.sh linux-x86_64 current dist
+      - name: Smoke test on Debian 13 without Swift
+        run: |
+          docker run --rm \
+            --volume "$PWD/dist:/dist:ro" \
+            --volume "$PWD/scripts/smoke-test.sh:/smoke-test.sh:ro" \
+            debian:13-slim sh -ec '
+              if command -v swift; then exit 1; fi
+              tar -xzf /dist/vernissagectl-linux-x86_64.tar.gz -C /tmp
+              sh /smoke-test.sh /tmp/vernissagectl
+            '
+      - name: Record build and checksum
+        run: |
+          printf 'Test build for update all\nCommit: %s\nSources tree: %s\n' \
+            "$GITHUB_SHA" "$(git rev-parse HEAD:Sources)" > dist/BUILD-INFO.txt
+          swift --version >> dist/BUILD-INFO.txt
+          cd dist
+          sha256sum vernissagectl-linux-x86_64.tar.gz > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vernissagectl-update-all-linux-x86_64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
